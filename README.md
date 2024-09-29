@@ -1,5 +1,5 @@
 # @react-native-oh-tpl/react-native-mmkv-storage
-本项目基于 [react-native-charts-wrapper](https://github.com/ammarahm-ed/react-native-mmkv-storage)
+本项目基于 [react-native-mmkv-storage](https://github.com/ammarahm-ed/react-native-mmkv-storage)
 
 ## 文档地址 / Documentation URL 
 
