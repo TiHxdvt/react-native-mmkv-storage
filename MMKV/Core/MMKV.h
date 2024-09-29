@@ -20,10 +20,23 @@
 
 #ifndef MMKV_MMKV_H
 #define MMKV_MMKV_H
-#ifdef  __cplusplus
+#ifdef __cplusplus
+#include "MMKVPredef.h"
 
-#include "MMBuffer.h"
+#ifdef MMKV_APPLE
+
+#  include "MMBuffer.h"
+#  ifdef MMKV_HAS_CPP20
+#    include <span>
+#  endif
+
+#else
+#  include "MiniPBCoder.h"
+#endif
+
 #include <cstdint>
+#include <type_traits>
+#include <cstring>
 
 namespace mmkv {
 class CodedOutputData;
@@ -47,18 +60,44 @@ enum MMKVMode : uint32_t {
 #endif
 };
 
-#define OUT
+#define MMKV_OUT
+
+#ifdef MMKV_HAS_CPP20
+template <class T>
+struct mmkv_is_vector { static constexpr bool value = false; };
+template <class T, class A>
+struct mmkv_is_vector<std::vector<T, A>> { static constexpr bool value = true; };
+template <class T, size_t S>
+struct mmkv_is_vector<std::span<T, S>> { static constexpr bool value = true; };
+template <class T>
+inline constexpr bool mmkv_is_vector_v = mmkv_is_vector<T>::value;
+
+template <class T>
+concept MMKV_SUPPORTED_PRIMITIVE_VALUE_TYPE = std::is_integral_v<T> || std::is_floating_point_v<T>;
+
+template <class T>
+concept MMKV_SUPPORTED_POD_VALUE_TYPE = std::is_same_v<T, const char*> || std::is_same_v<T, std::string> ||
+    std::is_same_v<T, mmkv::MMBuffer>;
+
+template <class T>
+concept MMKV_SUPPORTED_VECTOR_VALUE_TYPE = mmkv_is_vector_v<T> &&
+    (MMKV_SUPPORTED_PRIMITIVE_VALUE_TYPE<typename T::value_type> || MMKV_SUPPORTED_POD_VALUE_TYPE<typename T::value_type>);
+
+template <class T>
+concept MMKV_SUPPORTED_VALUE_TYPE = MMKV_SUPPORTED_PRIMITIVE_VALUE_TYPE<T> || MMKV_SUPPORTED_POD_VALUE_TYPE<T> ||
+    MMKV_SUPPORTED_VECTOR_VALUE_TYPE<T>;
+#endif // MMKV_HAS_CPP20
 
 class MMKV {
 #ifndef MMKV_ANDROID
     std::string m_mmapKey;
-    MMKV(const std::string &mmapID, MMKVMode mode, std::string *cryptKey, MMKVPath_t *rootPath);
+    MMKV(const std::string &mmapID, MMKVMode mode, std::string *cryptKey, MMKVPath_t *rootPath, size_t expectedCapacity = 0);
 #else // defined(MMKV_ANDROID)
     mmkv::FileLock *m_fileModeLock;
     mmkv::InterProcessLock *m_sharedProcessModeLock;
     mmkv::InterProcessLock *m_exclusiveProcessModeLock;
 
-    MMKV(const std::string &mmapID, int size, MMKVMode mode, std::string *cryptKey, MMKVPath_t *rootPath);
+    MMKV(const std::string &mmapID, int size, MMKVMode mode, std::string *cryptKey, MMKVPath_t *rootPath, size_t expectedCapacity = 0);
 
     MMKV(const std::string &mmapID, int ashmemFD, int ashmemMetaFd, std::string *cryptKey = nullptr);
 #endif
@@ -70,6 +109,8 @@ class MMKV {
     MMKVPath_t m_crcPath;
     mmkv::MMKVMap *m_dic;
     mmkv::MMKVMapCrypt *m_dicCrypt;
+
+    size_t m_expectedCapacity;
 
     mmkv::MemoryFile *m_file;
     size_t m_actualSize;
@@ -92,19 +133,21 @@ class MMKV {
     bool m_enableKeyExpire = false;
     uint32_t m_expiredInSeconds = ExpireNever;
 
+    bool m_enableCompareBeforeSet = false;
+
 #ifdef MMKV_APPLE
     using MMKVKey_t = NSString *__unsafe_unretained;
     static bool isKeyEmpty(MMKVKey_t key) { return key.length <= 0; }
-#  define key_length(key) key.length
-#  define retain_key(key) [key retain]
-#  define release_key(key) [key release]
+#  define mmkv_key_length(key) key.length
+#  define mmkv_retain_key(key) [key retain]
+#  define mmkv_release_key(key) [key release]
 #else
-    using MMKVKey_t = const std::string &;
+    using MMKVKey_t = std::string_view;
     static bool isKeyEmpty(MMKVKey_t key) { return key.empty(); }
-#  define key_length(key) key.length()
-#  define retain_key(key) ((void)0)
-#  define release_key(key) ((void)0)
-#endif
+#  define mmkv_key_length(key) key.length()
+#  define mmkv_retain_key(key) ((void) 0)
+#  define mmkv_release_key(key) ((void) 0)
+#endif // !MMKV_APPLE
 
     void loadFromFile();
 
@@ -120,7 +163,8 @@ class MMKV {
 
     bool checkFileCRCValid(size_t actualSize, uint32_t crcDigest);
 
-    void recaculateCRCDigestWithIV(const void *iv);
+    void recalculateCRCDigestWithIV(const void *iv);
+    void recalculateCRCDigestOnly();
 
     void updateCRCDigest(const uint8_t *ptr, size_t length);
 
@@ -146,6 +190,9 @@ class MMKV {
 
     // isDataHolder: avoid memory copying
     bool setDataForKey(mmkv::MMBuffer &&data, MMKVKey_t key, bool isDataHolder = false);
+#ifndef MMKV_APPLE
+    bool setDataForKey(mmkv::MMBuffer &&data, MMKVKey_t key, uint32_t expireDuration);
+#endif
 
     bool removeDataForKey(MMKVKey_t key);
 
@@ -154,11 +201,20 @@ class MMKV {
     KVHolderRet_t doAppendDataWithKey(const mmkv::MMBuffer &data, const mmkv::MMBuffer &key, bool isDataHolder, uint32_t keyLength);
     KVHolderRet_t appendDataWithKey(const mmkv::MMBuffer &data, MMKVKey_t key, bool isDataHolder = false);
     KVHolderRet_t appendDataWithKey(const mmkv::MMBuffer &data, const mmkv::KeyValueHolder &kvHolder, bool isDataHolder = false);
+
+    KVHolderRet_t doOverrideDataWithKey(const mmkv::MMBuffer &data, const mmkv::MMBuffer &key, bool isDataHolder, uint32_t keyLength);
+    KVHolderRet_t overrideDataWithKey(const mmkv::MMBuffer &data, const mmkv::KeyValueHolder &kvHolder, bool isDataHolder = false);
+    KVHolderRet_t overrideDataWithKey(const mmkv::MMBuffer &data, MMKVKey_t key, bool isDataHolder = false);
+    bool checkSizeForOverride(size_t size);
 #ifdef MMKV_APPLE
     KVHolderRet_t appendDataWithKey(const mmkv::MMBuffer &data,
                                     MMKVKey_t key,
                                     const mmkv::KeyValueHolderCrypt &kvHolder,
                                     bool isDataHolder = false);
+    KVHolderRet_t overrideDataWithKey(const mmkv::MMBuffer &data,
+                                      MMKVKey_t key,
+                                      const mmkv::KeyValueHolderCrypt &kvHolder,
+                                      bool isDataHolder = false);
 #endif
 
     void notifyContentChanged();
@@ -176,38 +232,41 @@ class MMKV {
     mmkv::MMBuffer getDataWithoutMTimeForKey(MMKVKey_t key);
     size_t filterExpiredKeys();
 
+#ifndef MMKV_APPLE
+    static constexpr uint32_t ConstFixed32Size = 4;
+    void shared_lock();
+    void shared_unlock();
+#endif
+
 public:
     // call this before getting any MMKV instance
     static void initializeMMKV(const MMKVPath_t &rootDir, MMKVLogLevel logLevel = MMKVLogInfo, mmkv::LogHandler handler = nullptr);
-
-#ifdef MMKV_APPLE
-    // protect from some old code that don't call initializeMMKV()
-    static void minimalInit(MMKVPath_t defaultRootDir);
-#endif
 
     // a generic purpose instance
     static MMKV *defaultMMKV(MMKVMode mode = MMKV_SINGLE_PROCESS, std::string *cryptKey = nullptr);
 
 #ifndef MMKV_ANDROID
 
-    // mmapID: any unique ID (com.tencent.xin.pay, etc)
+    // mmapID: any unique ID (com.tencent.xin.pay, etc.)
     // if you want a per-user mmkv, you could merge user-id within mmapID
     // cryptKey: 16 bytes at most
     static MMKV *mmkvWithID(const std::string &mmapID,
                             MMKVMode mode = MMKV_SINGLE_PROCESS,
                             std::string *cryptKey = nullptr,
-                            MMKVPath_t *rootPath = nullptr);
+                            MMKVPath_t *rootPath = nullptr,
+                            size_t expectedCapacity = 0);
 
 #else // defined(MMKV_ANDROID)
 
-    // mmapID: any unique ID (com.tencent.xin.pay, etc)
+    // mmapID: any unique ID (com.tencent.xin.pay, etc.)
     // if you want a per-user mmkv, you could merge user-id within mmapID
     // cryptKey: 16 bytes at most
     static MMKV *mmkvWithID(const std::string &mmapID,
                             int size = mmkv::DEFAULT_MMAP_SIZE,
                             MMKVMode mode = MMKV_SINGLE_PROCESS,
                             std::string *cryptKey = nullptr,
-                            MMKVPath_t *rootPath = nullptr);
+                            MMKVPath_t *rootPath = nullptr,
+                            size_t expectedCapacity = 0);
 
     static MMKV *mmkvWithAshmemFD(const std::string &mmapID, int fd, int metaFD, std::string *cryptKey = nullptr);
 
@@ -258,11 +317,21 @@ public:
     bool set(double value, MMKVKey_t key);
     bool set(double value, MMKVKey_t key, uint32_t expireDuration);
 
-    // avoid unexpected type conversion (pointer to bool, etc)
+#ifdef MMKV_HAS_CPP20
+    // avoid unexpected type conversion (pointer to bool, etc.)
     template <typename T>
+    requires(!MMKV_SUPPORTED_VALUE_TYPE<T>)
     bool set(T value, MMKVKey_t key) = delete;
+
+    // avoid unexpected type conversion (pointer to bool, etc.)
+    template <typename T>
+    requires(!MMKV_SUPPORTED_VALUE_TYPE<T>)
+    bool set(T value, MMKVKey_t key, uint32_t expireDuration) = delete;
+#else
+    // avoid unexpected type conversion (pointer to bool, etc.)
     template <typename T>
     bool set(T value, MMKVKey_t key, uint32_t expireDuration) = delete;
+#endif
 
 #ifdef MMKV_APPLE
     bool set(NSObject<NSCoding> *__unsafe_unretained obj, MMKVKey_t key);
@@ -276,13 +345,30 @@ public:
     bool set(const std::string &value, MMKVKey_t key);
     bool set(const std::string &value, MMKVKey_t key, uint32_t expireDuration);
 
+    bool set(std::string_view value, MMKVKey_t key);
+    bool set(std::string_view value, MMKVKey_t key, uint32_t expireDuration);
+
     bool set(const mmkv::MMBuffer &value, MMKVKey_t key);
     bool set(const mmkv::MMBuffer &value, MMKVKey_t key, uint32_t expireDuration);
 
     bool set(const std::vector<std::string> &vector, MMKVKey_t key);
     bool set(const std::vector<std::string> &vector, MMKVKey_t key, uint32_t expireDuration);
 
-    bool getString(MMKVKey_t key, std::string &result);
+#ifdef MMKV_HAS_CPP20
+    template<MMKV_SUPPORTED_VECTOR_VALUE_TYPE T>
+    bool set(const T& value, MMKVKey_t key) {
+        return set<T>(value, key, m_expiredInSeconds);
+    }
+
+    template<MMKV_SUPPORTED_VECTOR_VALUE_TYPE T>
+    bool set(const T& value, MMKVKey_t key, uint32_t expireDuration);
+
+    template<MMKV_SUPPORTED_VECTOR_VALUE_TYPE T>
+    bool getVector(MMKVKey_t key, T &result);
+#endif
+
+    // inplaceModification is recommended for faster speed
+    bool getString(MMKVKey_t key, std::string &result, bool inplaceModification = true);
 
     mmkv::MMBuffer getBytes(MMKVKey_t key);
 
@@ -291,19 +377,19 @@ public:
     bool getVector(MMKVKey_t key, std::vector<std::string> &result);
 #endif // MMKV_APPLE
 
-    bool getBool(MMKVKey_t key, bool defaultValue = false, OUT bool *hasValue = nullptr);
+    bool getBool(MMKVKey_t key, bool defaultValue = false, MMKV_OUT bool *hasValue = nullptr);
 
-    int32_t getInt32(MMKVKey_t key, int32_t defaultValue = 0, OUT bool *hasValue = nullptr);
+    int32_t getInt32(MMKVKey_t key, int32_t defaultValue = 0, MMKV_OUT bool *hasValue = nullptr);
 
-    uint32_t getUInt32(MMKVKey_t key, uint32_t defaultValue = 0, OUT bool *hasValue = nullptr);
+    uint32_t getUInt32(MMKVKey_t key, uint32_t defaultValue = 0, MMKV_OUT bool *hasValue = nullptr);
 
-    int64_t getInt64(MMKVKey_t key, int64_t defaultValue = 0, OUT bool *hasValue = nullptr);
+    int64_t getInt64(MMKVKey_t key, int64_t defaultValue = 0, MMKV_OUT bool *hasValue = nullptr);
 
-    uint64_t getUInt64(MMKVKey_t key, uint64_t defaultValue = 0, OUT bool *hasValue = nullptr);
+    uint64_t getUInt64(MMKVKey_t key, uint64_t defaultValue = 0, MMKV_OUT bool *hasValue = nullptr);
 
-    float getFloat(MMKVKey_t key, float defaultValue = 0, OUT bool *hasValue = nullptr);
+    float getFloat(MMKVKey_t key, float defaultValue = 0, MMKV_OUT bool *hasValue = nullptr);
 
-    double getDouble(MMKVKey_t key, double defaultValue = 0, OUT bool *hasValue = nullptr);
+    double getDouble(MMKVKey_t key, double defaultValue = 0, MMKV_OUT bool *hasValue = nullptr);
 
     // return the actual size consumption of the key's value
     // pass actualSize = true to get value's length
@@ -330,6 +416,14 @@ public:
 
     bool disableAutoKeyExpire();
 
+    // compare value for key before set, to reduce the possibility of file expanding
+    bool enableCompareBeforeSet();
+    bool disableCompareBeforeSet();
+
+    bool isExpirationEnabled() const { return m_enableKeyExpire; }
+    bool isEncryptionEnabled() const { return m_dicCrypt; }
+    bool isCompareBeforeSetEnabled() const { return m_enableCompareBeforeSet && !m_enableKeyExpire && !m_dicCrypt; }
+
 #ifdef MMKV_APPLE
     // filterExpire: return all non-expired keys, keep in mind it comes with cost
     NSArray *allKeys(bool filterExpire = false);
@@ -352,7 +446,8 @@ public:
 
     void removeValueForKey(MMKVKey_t key);
 
-    void clearAll();
+    // keepSpace: remove all keys but keep the file size not changed, running faster
+    void clearAll(bool keepSpace = false);
 
     // MMKV's size won't reduce after deleting key-values
     // call this method after lots of deleting if you care about disk usage
@@ -365,7 +460,8 @@ public:
 
     // call this method if you are facing memory-warning
     // any subsequent call to the instance will load all key-values from file again
-    void clearMemoryCache();
+    // keepSpace: remove all keys but keep the file size not changed, running faster
+    void clearMemoryCache(bool keepSpace = false);
 
     // you don't need to call this, really, I mean it
     // unless you worry about running out of battery
@@ -375,6 +471,13 @@ public:
     void lock();
     void unlock();
     bool try_lock();
+
+    // get thread lock
+#ifndef MMKV_WIN32
+    void lock_thread();
+    void unlock_thread();
+    bool try_lock_thread();
+#endif
 
     static const MMKVPath_t &getRootDir();
 
@@ -422,10 +525,55 @@ public:
     // Note: Don't use this to check the existence of the instance, the return value is undefined if the file was never created.
     static bool isFileValid(const std::string &mmapID, MMKVPath_t *relatePath = nullptr);
 
+    // remove the storage of the MMKV, including the data file & meta file (.crc)
+    // Note: the existing instance (if any) will be closed & destroyed
+    static bool removeStorage(const std::string &mmapID, MMKVPath_t *relatePath = nullptr);
+
     // just forbid it for possibly misuse
     explicit MMKV(const MMKV &other) = delete;
     MMKV &operator=(const MMKV &other) = delete;
 };
+
+#if defined(MMKV_HAS_CPP20) && !defined(MMKV_APPLE)
+template<MMKV_SUPPORTED_VECTOR_VALUE_TYPE T>
+bool MMKV::set(const T& value, MMKVKey_t key, uint32_t expireDuration) {
+    if (isKeyEmpty(key)) {
+        return false;
+    }
+    mmkv::MMBuffer data;
+    if constexpr (std::is_same_v<T, std::vector<bool>>) {
+        data = mmkv::MiniPBCoder::encodeDataWithObject(value);
+    } else {
+        data = mmkv::MiniPBCoder::encodeDataWithObject(std::span(value));
+    }
+    if (mmkv_unlikely(m_enableKeyExpire) && data.length() > 0) {
+        auto tmp = mmkv::MMBuffer(data.length() + ConstFixed32Size);
+        auto ptr = (uint8_t *) tmp.getPtr();
+        memcpy(ptr, data.getPtr(), data.length());
+        auto time = (expireDuration != ExpireNever) ? getCurrentTimeInSecond() + expireDuration : ExpireNever;
+        memcpy(ptr + data.length(), &time, ConstFixed32Size);
+        data = std::move(tmp);
+    }
+    return setDataForKey(std::move(data), key);
+}
+
+template<MMKV_SUPPORTED_VECTOR_VALUE_TYPE T>
+bool MMKV::getVector(MMKVKey_t key, T &result) {
+    if (isKeyEmpty(key)) {
+        return false;
+    }
+    shared_lock();
+
+    bool ret = false;
+    auto data = getDataForKey(key);
+    if (data.length() > 0) {
+        ret = mmkv::MiniPBCoder::decodeVector(data, result);
+    }
+
+    shared_unlock();
+    return ret;
+}
+#endif // MMKV_HAS_CPP20 && !MMKV_APPLE
 
 MMKV_NAMESPACE_END
 
